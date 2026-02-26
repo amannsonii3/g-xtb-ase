@@ -12,6 +12,8 @@ from ase.calculators.calculator import CalculatorSetupError
 from ase.io import write
 from ase.units import Hartree, Bohr
 
+from gxtb_ase.log_parser import parse_gxtb_log
+
 
 class GxTB(FileIOCalculator):
     """ASE calculator for g-xTB.
@@ -48,11 +50,29 @@ class GxTB(FileIOCalculator):
         Directory for temporary files. If None, uses system temp.
     keep_files : bool
         Keep calculation files after completion (default: False)
+
+    Notes
+    -----
+    The ``directory`` parameter is resolved to an absolute path at init time.
+    If the process working directory is changed before the calculator is
+    created (e.g. by ``uv --directory``), pass an explicit absolute path::
+
+        calc = GxTB(directory="/path/to/output/dir", ...)
     """
 
     name = "gxtb"
     implemented_properties = ["energy", "forces", "dipole", "charges"]
-    command = None  # Set dynamically
+    # Properties that require log file parsing but are not standard ASE properties.
+    # Accessed via calc.results or calc.get_electronic_properties().
+    _log_properties = frozenset({
+        "gap_eV",
+        "is_uks",
+        "IP_Janak_eV",
+        "EA_Janak_eV",
+        "spin_contamination",
+        "nopen",
+        "nel",
+    })
 
     default_parameters = {
         "charge": 0,
@@ -98,6 +118,11 @@ class GxTB(FileIOCalculator):
         **kwargs : dict
             Additional parameters: charge, spin, numerical_grad, etc.
         """
+        # Resolve directory to absolute path at init time so that files are
+        # written relative to the caller's working directory, not wherever
+        # the process cwd happens to be at calculation time.
+        directory = str(Path(directory).resolve())
+
         # g-xTB config for files
         self.tmpdir = tmpdir
         self.keep_files = keep_files
@@ -420,6 +445,7 @@ class GxTB(FileIOCalculator):
             ".HESS",
             ".MOLDEN",
             ".data",
+            # "gxtbrestart",
             f"{self.label}.out",
         ]
 
@@ -458,10 +484,14 @@ class GxTB(FileIOCalculator):
             if restart_file.exists():
                 restart_file.unlink()
 
-        # Force log if dipole or charges
-        need_dipole = "dipole" in properties
-        need_charges = "charges" in properties
-        if need_dipole or need_charges:
+        # Force log writing temporarily if log-parsed properties are needed.
+        # Preserve the user's original setting and restore it after cleanup.
+        user_write_log = self.parameters.get("write_log", False)
+        need_log = any(
+            prop in properties
+            for prop in ("dipole", "charges", *self._log_properties)
+        )
+        if need_log:
             self.parameters["write_log"] = True
 
         # Build command based on properties
@@ -485,6 +515,11 @@ class GxTB(FileIOCalculator):
         FileIOCalculator.calculate(self, atoms, properties, system_changes)
 
         self.read(self.label)
+
+        # Restore user's original write_log preference before cleanup,
+        # so that a temporarily-forced log file gets removed if the user
+        # didn't ask for it.
+        self.parameters["write_log"] = user_write_log
 
         self._cleanup_calculation_files()
 
@@ -534,6 +569,9 @@ class GxTB(FileIOCalculator):
                 if energy is None:
                     energy = result
 
+            # Extract electronic properties via the shared log parser
+            self._parse_electronic_properties(log_file)
+
         # Fallback to .out file if it exists
         if energy is None:
             output_file = Path(self.directory) / f"{self.label}.out"
@@ -551,6 +589,9 @@ class GxTB(FileIOCalculator):
                         dipole = parsed_dipole
                 else:
                     energy = result
+
+                # Extract electronic properties from fallback file
+                self._parse_electronic_properties(output_file)
 
         if energy is None:
             error_msg = "Could not parse energy from g-xTB calculation."
@@ -572,6 +613,54 @@ class GxTB(FileIOCalculator):
             self.results["dipole"] = dipole
         if charges is not None:
             self.results["charges"] = charges
+
+    def _parse_electronic_properties(self, log_file):
+        """Extract electronic properties from log file using the shared parser.
+
+        Populates ``self.results`` with keys from ``_log_properties`` (e.g.
+        ``gap_eV``, ``is_uks``, ``IP_Janak_eV``, etc.) so that downstream
+        code can access them via ``calc.results``.
+
+        Parameters
+        ----------
+        log_file : Path
+            Path to the g-xTB log / output file.
+        """
+        props = parse_gxtb_log(str(log_file))
+
+        for key in self._log_properties:
+            if key in props and props[key] is not None:
+                self.results[key] = props[key]
+
+    def get_electronic_properties(self, atoms=None):
+        """Return a dict of all electronic properties parsed from the log.
+
+        Forces a calculation (with log output) if results are not yet
+        available.  The returned dict may contain:
+
+        - ``gap_eV``: float (RKS) or dict (UKS with alpha/beta channels)
+        - ``is_uks``: bool
+        - ``IP_Janak_eV``: float  (RKS only)
+        - ``EA_Janak_eV``: float  (RKS only)
+        - ``spin_contamination``: float  (UKS only)
+        - ``nopen``: int
+        - ``nel``: int
+
+        Parameters
+        ----------
+        atoms : Atoms, optional
+            If provided, triggers a new calculation.
+
+        Returns
+        -------
+        dict
+            Electronic properties available from the last calculation.
+        """
+        if atoms is not None or not any(k in self.results for k in self._log_properties):
+            props = list(self.implemented_properties) + list(self._log_properties)
+            self.calculate(atoms, props)
+
+        return {k: self.results[k] for k in self._log_properties if k in self.results}
 
     def _parse_energy_file(self, energy_file):
         """Parse energy from TURBOMOLE-style energy file."""
