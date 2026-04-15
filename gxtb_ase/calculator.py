@@ -502,6 +502,14 @@ class GxTB(FileIOCalculator):
 
         self.read(self.label)
 
+        # ASE stores self.atoms as a copy (atoms.copy()), so gxtb_* keys
+        # written to self.atoms.info must be propagated back to the caller's
+        # atoms object so that atoms.info is populated after the call returns.
+        if atoms is not None:
+            for key, value in self.atoms.info.items():
+                if key.startswith("gxtb_"):
+                    atoms.info[key] = value
+
         # Restore user's original write_log preference before cleanup,
         # so that a temporarily-forced log file gets removed if the user
         # didn't ask for it.

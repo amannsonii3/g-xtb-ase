@@ -19,8 +19,9 @@ atoms = read(SCRIPT_DIR / "structures" / "Ag_min_35atoms.xyz")
 
 # write_log=True ensures the log file is parsed so that electronic
 # properties (gap, IP, EA, ...) are populated into atoms.info.
+# The log is written to {directory}/{label}.log, i.e. examples/Ag35_rks.log here.
 calc = GxTB(
-    label="Ag35",
+    label="Ag35_rks",
     charge=0,
     spin=0,
     write_log=True,
@@ -49,3 +50,31 @@ if ip is not None:
     print(f"IP (Janak)    : {ip} eV")
 if ea is not None:
     print(f"EA (Janak)    : {ea} eV")
+
+# --- UKS example: neutral doublet (charge=+1 gives 189 electrons, odd → spin=1) ---
+print("\n--- UKS doublet (charge=+1, spin=1) ---")
+atoms_uks = read(SCRIPT_DIR / "structures" / "Ag_min_35atoms.xyz")
+
+# The log is written to examples/Ag35_uks.log
+calc_uks = GxTB(
+    label="Ag35_uks",
+    charge=1,
+    spin=1,
+    write_log=True,
+    directory=str(SCRIPT_DIR),
+)
+atoms_uks.calc = calc_uks
+
+energy_uks = atoms_uks.get_potential_energy()
+print(f"Total energy : {energy_uks:.6f} eV")
+
+print("\nElectronic properties (atoms.info):")
+for key in sorted(k for k in atoms_uks.info if k.startswith("gxtb_")):
+    print(f"  {key}: {atoms_uks.info[key]}")
+
+# UKS gap is a dict with alpha->alpha, beta->beta, alpha->beta channels
+gap_uks = atoms_uks.info.get("gxtb_gap_eV")
+sc = atoms_uks.info.get("gxtb_spin_contamination")
+print(f"\nHOMO-LUMO gap : {gap_uks}")
+if sc is not None:
+    print(f"Spin contamination: {sc}")
