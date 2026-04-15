@@ -460,12 +460,12 @@ class GxTB(FileIOCalculator):
             if restart_file.exists():
                 restart_file.unlink()
 
-        # Force log writing temporarily if log-parsed properties are needed.
-        # Preserve the user's original setting and restore it after cleanup.
+        # Always write the log temporarily so dipole, charges, and electronic
+        # properties (gap, IP, EA, spin) can be parsed. It is removed after
+        # parsing by _cleanup_calculation_files() if the user did not set
+        # write_log=True, matching the existing pattern for dipole/charges.
         user_write_log = self.parameters.get("write_log", False)
-        need_log = any(prop in properties for prop in ("dipole", "charges"))
-        if need_log:
-            self.parameters["write_log"] = True
+        self.parameters["write_log"] = True
 
         # Build command based on properties
         force_grad = "forces" in properties and self.parameters.get("numerical_grad")
