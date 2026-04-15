@@ -50,18 +50,11 @@ class GxTB(FileIOCalculator):
         Directory for temporary files. If None, uses system temp.
     keep_files : bool
         Keep calculation files after completion (default: False)
-
-    Notes
-    -----
-    The ``directory`` parameter is resolved to an absolute path at init time.
-    If the process working directory is changed before the calculator is
-    created (e.g. by ``uv --directory``), pass an explicit absolute path::
-
-        calc = GxTB(directory="/path/to/output/dir", ...)
     """
 
     name = "gxtb"
     implemented_properties = ["energy", "forces", "dipole", "charges"]
+    command = None  # Set dynamically
 
     default_parameters = {
         "charge": 0,
@@ -107,11 +100,6 @@ class GxTB(FileIOCalculator):
         **kwargs : dict
             Additional parameters: charge, spin, numerical_grad, etc.
         """
-        # Resolve directory to absolute path at init time so that files are
-        # written relative to the caller's working directory, not wherever
-        # the process cwd happens to be at calculation time.
-        directory = str(Path(directory).resolve())
-
         # g-xTB config for files
         self.tmpdir = tmpdir
         self.keep_files = keep_files
@@ -434,7 +422,6 @@ class GxTB(FileIOCalculator):
             ".HESS",
             ".MOLDEN",
             ".data",
-            # "gxtbrestart",
             f"{self.label}.out",
         ]
 
@@ -473,12 +460,12 @@ class GxTB(FileIOCalculator):
             if restart_file.exists():
                 restart_file.unlink()
 
-        # Force log writing temporarily if log-parsed properties are needed.
-        # Preserve the user's original setting and restore it after cleanup.
+        # Always write the log temporarily so dipole, charges, and electronic
+        # properties (gap, IP, EA, spin) can be parsed. It is removed after
+        # parsing by _cleanup_calculation_files() if the user did not set
+        # write_log=True, matching the existing pattern for dipole/charges.
         user_write_log = self.parameters.get("write_log", False)
-        need_log = any(prop in properties for prop in ("dipole", "charges"))
-        if need_log:
-            self.parameters["write_log"] = True
+        self.parameters["write_log"] = True
 
         # Build command based on properties
         force_grad = "forces" in properties and self.parameters.get("numerical_grad")
@@ -563,7 +550,7 @@ class GxTB(FileIOCalculator):
                 if energy is None:
                     energy = result
 
-            # Extract electronic properties via the shared log parser
+            # Extract electronic properties from log into atoms.info
             self._parse_electronic_properties(log_file)
 
         # Fallback to .out file if it exists
@@ -583,9 +570,6 @@ class GxTB(FileIOCalculator):
                         dipole = parsed_dipole
                 else:
                     energy = result
-
-                # Extract electronic properties from fallback file
-                self._parse_electronic_properties(output_file)
 
         if energy is None:
             error_msg = "Could not parse energy from g-xTB calculation."
@@ -651,7 +635,6 @@ class GxTB(FileIOCalculator):
         text = Path(logfile).read_text()
         result = {}
 
-        # Charge, nel, nopen
         m = re.search(r'^\s*nel\s+(\d+)', text, re.MULTILINE)
         if m:
             result['nel'] = int(m.group(1))
@@ -659,7 +642,6 @@ class GxTB(FileIOCalculator):
         if m:
             result['nopen'] = int(m.group(1))
 
-        # UKS vs RKS and gap
         is_uks = bool(re.search(r'UKS \?\s+T', text))
         result['is_uks'] = is_uks
 
@@ -680,7 +662,6 @@ class GxTB(FileIOCalculator):
             if matches:
                 result['gap_eV'] = float(matches[-1])
 
-        # Janak's theorem IP/EA (RKS only)
         m = re.search(r"Janaks theorem for IP\s*:\s+([\d.]+)", text)
         if m:
             result['IP_Janak_eV'] = float(m.group(1))
@@ -688,7 +669,6 @@ class GxTB(FileIOCalculator):
         if m:
             result['EA_Janak_eV'] = float(m.group(1))
 
-        # Spin contamination (UKS only)
         m = re.search(r'spin-contamination:\s+([\d.]+)', text)
         if m:
             result['spin_contamination'] = float(m.group(1))

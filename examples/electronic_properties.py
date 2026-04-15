@@ -60,7 +60,7 @@ calc_uks = GxTB(
     label="Ag35_uks",
     charge=1,
     spin=1,
-    write_log=True,
+    write_log=False,
     directory=str(SCRIPT_DIR),
 )
 atoms_uks.calc = calc_uks
