@@ -6,13 +6,13 @@ import tempfile
 import subprocess
 from pathlib import Path
 
+import re
+
 import numpy as np
 from ase.calculators.calculator import FileIOCalculator, all_changes
 from ase.calculators.calculator import CalculatorSetupError
 from ase.io import write
 from ase.units import Hartree, Bohr
-
-from gxtb_ase.log_parser import parse_gxtb_log
 
 
 class GxTB(FileIOCalculator):
@@ -62,17 +62,6 @@ class GxTB(FileIOCalculator):
 
     name = "gxtb"
     implemented_properties = ["energy", "forces", "dipole", "charges"]
-    # Properties that require log file parsing but are not standard ASE properties.
-    # Accessed via calc.results or calc.get_electronic_properties().
-    _log_properties = frozenset({
-        "gap_eV",
-        "is_uks",
-        "IP_Janak_eV",
-        "EA_Janak_eV",
-        "spin_contamination",
-        "nopen",
-        "nel",
-    })
 
     default_parameters = {
         "charge": 0,
@@ -487,10 +476,7 @@ class GxTB(FileIOCalculator):
         # Force log writing temporarily if log-parsed properties are needed.
         # Preserve the user's original setting and restore it after cleanup.
         user_write_log = self.parameters.get("write_log", False)
-        need_log = any(
-            prop in properties
-            for prop in ("dipole", "charges", *self._log_properties)
-        )
+        need_log = any(prop in properties for prop in ("dipole", "charges"))
         if need_log:
             self.parameters["write_log"] = True
 
@@ -615,52 +601,91 @@ class GxTB(FileIOCalculator):
             self.results["charges"] = charges
 
     def _parse_electronic_properties(self, log_file):
-        """Extract electronic properties from log file using the shared parser.
+        """Extract non-standard electronic properties from log and store in atoms.info.
 
-        Populates ``self.results`` with keys from ``_log_properties`` (e.g.
-        ``gap_eV``, ``is_uks``, ``IP_Janak_eV``, etc.) so that downstream
-        code can access them via ``calc.results``.
+        Parses the g-xTB log file for properties such as the HOMO-LUMO gap,
+        IP, EA, and spin information, then attaches them to ``self.atoms.info``
+        under ``gxtb_``-prefixed keys so they are preserved alongside the
+        structure (e.g. in extXYZ files) without polluting ``calc.results``.
 
         Parameters
         ----------
         log_file : Path
             Path to the g-xTB log / output file.
         """
-        props = parse_gxtb_log(str(log_file))
+        if self.atoms is None:
+            return
 
-        for key in self._log_properties:
+        props = self._parse_gxtb_log(str(log_file))
+
+        info_map = {
+            "gap_eV": "gxtb_gap_eV",
+            "is_uks": "gxtb_is_uks",
+            "IP_Janak_eV": "gxtb_IP_Janak_eV",
+            "EA_Janak_eV": "gxtb_EA_Janak_eV",
+            "spin_contamination": "gxtb_spin_contamination",
+            "nopen": "gxtb_nopen",
+            "nel": "gxtb_nel",
+        }
+
+        for key, info_key in info_map.items():
             if key in props and props[key] is not None:
-                self.results[key] = props[key]
+                self.atoms.info[info_key] = props[key]
 
-    def get_electronic_properties(self, atoms=None):
-        """Return a dict of all electronic properties parsed from the log.
-
-        Forces a calculation (with log output) if results are not yet
-        available.  The returned dict may contain:
-
-        - ``gap_eV``: float (RKS) or dict (UKS with alpha/beta channels)
-        - ``is_uks``: bool
-        - ``IP_Janak_eV``: float  (RKS only)
-        - ``EA_Janak_eV``: float  (RKS only)
-        - ``spin_contamination``: float  (UKS only)
-        - ``nopen``: int
-        - ``nel``: int
-
-        Parameters
-        ----------
-        atoms : Atoms, optional
-            If provided, triggers a new calculation.
+    def _parse_gxtb_log(self, logfile: str) -> dict:
+        """Parse a g-xTB log file and return a dict of electronic properties.
 
         Returns
         -------
-        dict
-            Electronic properties available from the last calculation.
+        dict with keys: ``is_uks``, ``gap_eV``, ``nel``, ``nopen``,
+        ``IP_Janak_eV``, ``EA_Janak_eV``, ``spin_contamination``.
         """
-        if atoms is not None or not any(k in self.results for k in self._log_properties):
-            props = list(self.implemented_properties) + list(self._log_properties)
-            self.calculate(atoms, props)
+        text = Path(logfile).read_text()
+        result = {}
 
-        return {k: self.results[k] for k in self._log_properties if k in self.results}
+        # Charge, nel, nopen
+        m = re.search(r'^\s*nel\s+(\d+)', text, re.MULTILINE)
+        if m:
+            result['nel'] = int(m.group(1))
+        m = re.search(r'^\s*nopen\s+(\d+)', text, re.MULTILINE)
+        if m:
+            result['nopen'] = int(m.group(1))
+
+        # UKS vs RKS and gap
+        is_uks = bool(re.search(r'UKS \?\s+T', text))
+        result['is_uks'] = is_uks
+
+        if is_uks:
+            gaps = {}
+            m = re.search(r'gap \(eV\)\s+alpha\s*->\s*alpha\s*:\s+([\d.]+)', text)
+            if m:
+                gaps['alpha_alpha'] = float(m.group(1))
+            m = re.search(r'beta\s*->\s*beta\s*:\s+([\d.]+)', text)
+            if m:
+                gaps['beta_beta'] = float(m.group(1))
+            m = re.search(r'alpha\s*->\s*beta\s*:\s+([\d.]+)', text)
+            if m:
+                gaps['alpha_beta'] = float(m.group(1))
+            result['gap_eV'] = gaps if gaps else None
+        else:
+            matches = re.findall(r'gap \(eV\)\s+:\s+([\d.]+)', text)
+            if matches:
+                result['gap_eV'] = float(matches[-1])
+
+        # Janak's theorem IP/EA (RKS only)
+        m = re.search(r"Janaks theorem for IP\s*:\s+([\d.]+)", text)
+        if m:
+            result['IP_Janak_eV'] = float(m.group(1))
+        m = re.search(r"Janaks theorem for EA\s*:\s+([\d.]+)", text)
+        if m:
+            result['EA_Janak_eV'] = float(m.group(1))
+
+        # Spin contamination (UKS only)
+        m = re.search(r'spin-contamination:\s+([\d.]+)', text)
+        if m:
+            result['spin_contamination'] = float(m.group(1))
+
+        return result
 
     def _parse_energy_file(self, energy_file):
         """Parse energy from TURBOMOLE-style energy file."""
